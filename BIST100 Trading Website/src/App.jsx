@@ -329,6 +329,26 @@ function formatDate(value) {
   }).format(new Date(value));
 }
 
+function formatShortDate(value) {
+  if (!value) return "-";
+  return new Intl.DateTimeFormat("tr-TR", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric"
+  }).format(new Date(value));
+}
+
+function getNextSessionDate(from = new Date()) {
+  const next = new Date(from);
+  next.setDate(next.getDate() + 1);
+
+  while ([0, 6].includes(next.getDay())) {
+    next.setDate(next.getDate() + 1);
+  }
+
+  return next;
+}
+
 function toOptionalNumber(value) {
   const normalized = String(value || "").replace(",", ".").trim();
   if (!normalized) return null;
@@ -360,6 +380,95 @@ function calculateRsi(rows, period = 14) {
   return 100 - 100 / (1 + gains / losses);
 }
 
+function describeScoreImpact(value) {
+  if (value >= 18) return "cok guclu pozitif";
+  if (value >= 9) return "pozitif";
+  if (value > -6) return "sinirli";
+  return "negatif";
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function formatZone(zone) {
+  if (!zone) return "-";
+  return `${formatMoney(zone.low)} - ${formatMoney(zone.high)}`;
+}
+
+function buildPriceZones(rows, latestClose, avgVolume) {
+  const tolerance = Math.max(latestClose * 0.012, 0.01);
+  const pivots = [];
+
+  rows.forEach((row, index) => {
+    const previous = rows[index - 1];
+    const next = rows[index + 1];
+    const volumeWeight = avgVolume > 0 ? clamp((row.volume || 0) / avgVolume, 0.6, 1.8) : 1;
+
+    if (!previous || !next) return;
+
+    if (row.low <= previous.low && row.low <= next.low) {
+      pivots.push({ type: "support", price: row.low, volumeWeight });
+    }
+
+    if (row.high >= previous.high && row.high >= next.high) {
+      pivots.push({ type: "resistance", price: row.high, volumeWeight });
+    }
+  });
+
+  const cluster = (items) => {
+    const clusters = [];
+    items
+      .sort((left, right) => left.price - right.price)
+      .forEach((item) => {
+        const match = clusters.find((current) => Math.abs(current.center - item.price) <= tolerance);
+        if (match) {
+          match.prices.push(item.price);
+          match.score += item.volumeWeight;
+          match.center = match.prices.reduce((total, price) => total + price, 0) / match.prices.length;
+        } else {
+          clusters.push({ center: item.price, prices: [item.price], score: item.volumeWeight });
+        }
+      });
+
+    return clusters.map((item) => ({
+      center: item.center,
+      low: Math.min(...item.prices) - tolerance * 0.25,
+      high: Math.max(...item.prices) + tolerance * 0.25,
+      touches: item.prices.length,
+      score: item.score
+    }));
+  };
+
+  const supports = cluster(pivots.filter((pivot) => pivot.type === "support" && pivot.price <= latestClose));
+  const resistances = cluster(pivots.filter((pivot) => pivot.type === "resistance" && pivot.price >= latestClose));
+  const fallbackSupport = Math.min(...rows.map((row) => row.low));
+  const fallbackResistance = Math.max(...rows.map((row) => row.high));
+  const pickZone = (zones, fallback, isSupport) => {
+    if (!zones.length) {
+      return {
+        center: fallback,
+        low: fallback - tolerance * 0.35,
+        high: fallback + tolerance * 0.35,
+        touches: 1,
+        score: 1
+      };
+    }
+
+    return zones
+      .map((zone) => ({
+        ...zone,
+        rank: zone.score * 2 + zone.touches - Math.abs(latestClose - zone.center) / latestClose * 20
+      }))
+      .sort((left, right) => right.rank - left.rank)[0];
+  };
+
+  return {
+    supportZone: pickZone(supports, fallbackSupport, true),
+    resistanceZone: pickZone(resistances, fallbackResistance, false)
+  };
+}
+
 function calculateAnalysis(rows, fundamentals) {
   const latest = rows.at(-1);
   const previous = rows.at(-2) || latest;
@@ -368,16 +477,35 @@ function calculateAnalysis(rows, fundamentals) {
   const ma50 = movingAverage(rows, 50).at(-1) || ma20;
   const rsi = calculateRsi(rows);
   const rangeRows = rows.slice(-60);
-  const support = Math.min(...rangeRows.map((row) => row.low));
-  const resistance = Math.max(...rangeRows.map((row) => row.high));
   const avgVolume = rangeRows.reduce((total, row) => total + (row.volume || 0), 0) / Math.max(rangeRows.length, 1);
+  const volumeRatio = avgVolume > 0 ? (latest.volume || 0) / avgVolume : 0;
+  const { supportZone, resistanceZone } = buildPriceZones(rangeRows, latest.close, avgVolume);
+  const support = supportZone.center;
+  const resistance = resistanceZone.center;
   const dailyChange = ((latest.close - previous.close) / previous.close) * 100;
   const periodChange = ((latest.close - firstVisible.close) / firstVisible.close) * 100;
   const distanceToSupport = ((latest.close - support) / latest.close) * 100;
   const distanceToResistance = ((resistance - latest.close) / latest.close) * 100;
   const volatility = rangeRows.reduce((total, row) => total + ((row.high - row.low) / row.close) * 100, 0) / Math.max(rangeRows.length, 1);
+  const trendBias = (latest.close > ma20 ? 0.22 : -0.18) + (ma20 > ma50 ? 0.18 : -0.12);
+  const momentumBias = rsi < 35 ? 0.22 : rsi > 70 ? -0.24 : 0;
+  const openMove = clamp(dailyChange * 0.16 + trendBias + momentumBias, -volatility * 0.35, volatility * 0.35);
+  const predictedOpen = latest.close * (1 + openMove / 100);
+  const closeMove = clamp(openMove * 0.35 + trendBias * 1.25 + (volumeRatio > 1.2 ? 0.12 : 0) - (distanceToResistance < 3 ? 0.22 : 0), -volatility * 0.45, volatility * 0.45);
+  const predictedClose = predictedOpen * (1 + closeMove / 100);
+  const forecastLow = Math.min(predictedOpen, predictedClose) * (1 - Math.min(volatility * 0.12, 0.75) / 100);
+  const forecastHigh = Math.max(predictedOpen, predictedClose) * (1 + Math.min(volatility * 0.12, 0.75) / 100);
+  const forecastChange = ((predictedClose - latest.close) / latest.close) * 100;
+  const forecastDirection = forecastChange > 0.35 ? "Pozitif" : forecastChange < -0.35 ? "Negatif" : "Notr";
+  const forecastConfidence = Math.abs(forecastChange) > 0.9 && volatility < 4 ? "Orta" : "Dusuk";
+  const forecastSessionDate = getNextSessionDate();
+  const financialFields = ["pe", "pb", "roe", "roa", "debtToEquity", "revenue", "netIncome"];
+  const availableFinancialFields = financialFields.filter((key) => Number.isFinite(fundamentals?.[key]));
+  const financialCoverage = availableFinancialFields.length / financialFields.length;
+  const missingFinancialPenalty = financialCoverage < 0.35 ? -8 : financialCoverage < 0.6 ? -4 : 0;
 
   let score = 50;
+  let financialImpact = 0;
   if (latest.close > ma20) score += 11;
   else score -= 9;
   if (ma20 > ma50) score += 10;
@@ -390,22 +518,86 @@ function calculateAnalysis(rows, fundamentals) {
   if (volatility > 6) score -= 5;
 
   if (Number.isFinite(fundamentals?.pe)) {
-    if (fundamentals.pe > 0 && fundamentals.pe < 8) score += 8;
-    else if (fundamentals.pe > 35) score -= 8;
+    if (fundamentals.pe > 0 && fundamentals.pe < 8) financialImpact += 10;
+    else if (fundamentals.pe > 0 && fundamentals.pe <= 15) financialImpact += 7;
+    else if (fundamentals.pe > 25 && fundamentals.pe <= 35) financialImpact -= 4;
+    else if (fundamentals.pe > 35) financialImpact -= 9;
   }
   if (Number.isFinite(fundamentals?.pb)) {
-    if (fundamentals.pb > 0 && fundamentals.pb < 1.5) score += 6;
-    else if (fundamentals.pb > 6) score -= 5;
+    if (fundamentals.pb > 0 && fundamentals.pb < 1.2) financialImpact += 8;
+    else if (fundamentals.pb > 0 && fundamentals.pb <= 2.5) financialImpact += 4;
+    else if (fundamentals.pb > 6) financialImpact -= 6;
   }
   if (Number.isFinite(fundamentals?.roe)) {
-    if (fundamentals.roe > 18) score += 7;
-    else if (fundamentals.roe < 5) score -= 5;
+    if (fundamentals.roe > 25) financialImpact += 10;
+    else if (fundamentals.roe > 15) financialImpact += 7;
+    else if (fundamentals.roe < 5) financialImpact -= 6;
   }
-  if (Number.isFinite(fundamentals?.debtToEquity) && fundamentals.debtToEquity > 2.5) score -= 6;
+  if (Number.isFinite(fundamentals?.roa)) {
+    if (fundamentals.roa > 8) financialImpact += 5;
+    else if (fundamentals.roa < 1) financialImpact -= 4;
+  }
+  if (Number.isFinite(fundamentals?.debtToEquity)) {
+    if (fundamentals.debtToEquity < 0.8) financialImpact += 5;
+    else if (fundamentals.debtToEquity > 2.5) financialImpact -= 8;
+  }
+  if (Number.isFinite(fundamentals?.netIncome)) {
+    if (fundamentals.netIncome > 0) financialImpact += 4;
+    else if (fundamentals.netIncome < 0) financialImpact -= 8;
+  }
+  if (Number.isFinite(fundamentals?.revenue) && fundamentals.revenue > 0) financialImpact += 2;
+  if (Number.isFinite(fundamentals?.dividendYield) && fundamentals.dividendYield > 2) financialImpact += 3;
+  financialImpact = Math.max(-22, Math.min(30, financialImpact));
+  score += financialImpact;
+  score += missingFinancialPenalty;
   if (Number.isFinite(fundamentals?.recommendation)) score += Math.round(fundamentals.recommendation * 12);
+
+  if (rsi > 80) {
+    score = Math.min(score, 64);
+  } else if (rsi > 75 && distanceToResistance < 5) {
+    score = Math.min(score, 67);
+  }
 
   score = Math.max(0, Math.min(100, Math.round(score)));
   const action = score >= 68 ? "AL" : score <= 42 ? "SAT" : "BEKLE";
+  const trendText = latest.close > ma20 && ma20 > ma50
+    ? `Trend yapisi pozitif: fiyat MA20 uzerinde ve MA20, MA50'nin uzerinde.`
+    : latest.close > ma20
+      ? `Kisa vadede toparlanma var: fiyat MA20 uzerinde, ancak MA20/MA50 teyidi henuz tam guclu degil.`
+      : `Trend zayif: fiyat MA20 altinda kaldigi icin yukari hareket icin yeniden ortalama uzerine cikmasi izlenmeli.`;
+  const momentumText = rsi > 70
+    ? `Momentum isinmis: RSI ${rsi.toFixed(1)} ile asiri alim bolgesine yakin, yeni alimlarda aceleci davranmak riskli olabilir.`
+    : rsi < 35
+      ? `Momentum baski altinda: RSI ${rsi.toFixed(1)} ile asiri satim tarafina yakin, tepki denemesi takip edilebilir.`
+      : `Momentum dengeli: RSI ${rsi.toFixed(1)} ile ne asiri alim ne de asiri satim bolgesinde.`;
+  const levelText = distanceToResistance < 4
+    ? `Fiyat direnc bolgesine yakin: ${formatZone(resistanceZone)} araligina mesafe yaklasik ${distanceToResistance.toFixed(1)}%, bu alanda kar satisi riski artar.`
+    : distanceToSupport < 4
+      ? `Fiyat destek bolgesine yakin: ${formatZone(supportZone)} araligina mesafe yaklasik ${distanceToSupport.toFixed(1)}%, stop seviyesi icin kritik alan.`
+      : `Fiyat destek ve direnc arasinda dengede: destek bolgesi ${formatZone(supportZone)}, direnc bolgesi ${formatZone(resistanceZone)}.`;
+  const forecastText = `${formatShortDate(forecastSessionDate)} seansi icin kisa vadeli egilim ${forecastDirection.toLowerCase()}. Model araligi ${formatMoney(forecastLow)} - ${formatMoney(forecastHigh)}, guven ${forecastConfidence.toLowerCase()}.`;
+  const riskText = volatility > 6
+    ? `Volatilite yuksek: son 60 gun ortalama gun ici oynaklik ${volatility.toFixed(2)}%, pozisyon boyutu daha dikkatli secilmeli.`
+    : `Volatilite kontrollu: son 60 gun ortalama gun ici oynaklik ${volatility.toFixed(2)}%.`;
+  const volumeText = volumeRatio > 1.4
+    ? `Hacim ortalamanin uzerinde: son hacim 60 gunluk ortalamanin ${volumeRatio.toFixed(1)} kati, hareketin ilgisi artmis.`
+    : volumeRatio > 0
+      ? `Hacim normal: son hacim 60 gunluk ortalamanin ${volumeRatio.toFixed(1)} kati seviyesinde.`
+      : `Hacim verisi sinirli, hacim teyidi zayif okunmali.`;
+  const valuationText = Number.isFinite(fundamentals?.pe)
+    ? `Temel taraf ${describeScoreImpact(financialImpact)} katkida: F/K ${formatMoney(fundamentals.pe)}, PD/DD ${formatMoney(fundamentals.pb)}, ROE ${Number.isFinite(fundamentals?.roe) ? `${formatMoney(fundamentals.roe)}%` : "-"}, borcluluk ${Number.isFinite(fundamentals?.debtToEquity) ? formatMoney(fundamentals.debtToEquity) : "-"} ve karlilik birlikte puanlandi. Veri kapsami ${availableFinancialFields.length}/${financialFields.length}${missingFinancialPenalty ? `, eksik veri puani ${missingFinancialPenalty}` : ""}.`
+    : `Temel veri sinirli: ${availableFinancialFields.length}/${financialFields.length} ana finansal alan geldi. Bu nedenle model teknik agirligi artirdi ve eksik veri puani ${missingFinancialPenalty} olarak yansitti.`;
+  const decisionText = action === "AL"
+    ? `Tek skor ${score}/100: teknik gorunum ve finansal kalite birlikte yeterli esigi asti.`
+    : action === "SAT"
+      ? `Tek skor ${score}/100: zayif teknik gorunum veya finansal/risk baskisi satis sinyalini one cikardi.`
+      : rsi > 80
+        ? `Tek skor ${score}/100: trend veya finansallar guclu olsa bile RSI ${rsi.toFixed(1)} cok isinmis oldugu icin model AL sinyalini frenledi.`
+        : rsi > 75 && distanceToResistance < 5
+          ? `Tek skor ${score}/100: RSI yuksek ve fiyat direnc bolgesine yakin oldugu icin model yeni giris icin beklemeyi tercih etti.`
+      : financialImpact >= 18
+        ? `Tek skor ${score}/100: finansallar guclu, ancak teknik giris veya risk kosullari henuz AL esigini net gecirmedi.`
+        : `Tek skor ${score}/100: modelde olumlu ve olumsuz sinyaller dengede kaldigi icin bekleme agirlikta.`;
 
   return {
     latest,
@@ -416,17 +608,37 @@ function calculateAnalysis(rows, fundamentals) {
     rsi,
     support,
     resistance,
+    supportZone,
+    resistanceZone,
     avgVolume,
+    volumeRatio,
     volatility,
+    distanceToSupport,
+    distanceToResistance,
+    financialImpact,
+    financialCoverage,
+    missingFinancialPenalty,
+    predictedOpen,
+    predictedClose,
+    forecastLow,
+    forecastHigh,
+    forecastChange,
+    forecastDirection,
+    forecastConfidence,
+    forecastSessionDate,
     score,
     action,
-    buyZone: latest.close <= ma20 ? "Simdi izlenebilir" : `${formatMoney(ma20)} civarina geri cekilme`,
-    sellZone: distanceToResistance < 4 ? "Dirence yakin, kar alimi dusunulebilir" : `${formatMoney(resistance)} direnc bolgesi`,
+    buyZone: latest.close <= ma20 ? `Destek bolgesi izlenebilir: ${formatZone(supportZone)}` : `${formatMoney(ma20)} veya ${formatZone(supportZone)} civarina geri cekilme`,
+    sellZone: distanceToResistance < 4 ? "Dirence yakin, kar alimi dusunulebilir" : `${formatZone(resistanceZone)} direnc bolgesi`,
     reasons: [
-      latest.close > ma20 ? "Fiyat 20 gunluk ortalamanin uzerinde." : "Fiyat 20 gunluk ortalamanin altinda.",
-      ma20 > ma50 ? "Kisa trend uzun trende gore guclu." : "Kisa trend henuz teyit vermiyor.",
-      rsi > 70 ? "RSI asiri alim bolgesine yakin." : rsi < 35 ? "RSI asiri satim bolgesine yakin." : "RSI dengeli bolgede.",
-      Number.isFinite(fundamentals?.pe) ? `F/K ${formatMoney(fundamentals.pe)}, temel degerleme puana katildi.` : "Temel veri sinirli, teknik agirlik daha yuksek."
+      { title: "Trend", text: trendText },
+      { title: "Momentum", text: momentumText },
+      { title: "Destek / Direnc", text: levelText },
+      { title: "Risk", text: riskText },
+      { title: "Hacim", text: volumeText },
+      { title: "Temel", text: valuationText },
+      { title: "Tahmin", text: forecastText },
+      { title: "Karar", text: decisionText }
     ]
   };
 }
@@ -1207,10 +1419,13 @@ export default function App() {
                 const value = fundamentals?.[key];
                 const isPercent = ["dividendYield", "roe", "roa", "debtToEquity"].includes(key);
                 const isLarge = ["marketCap", "ev", "revenue", "netIncome"].includes(key);
+                const formattedValue = Number.isFinite(value)
+                  ? isLarge ? formatCompact(value) : isPercent ? `${formatMoney(value)}%` : formatMoney(value)
+                  : "-";
                 return (
                   <article key={key}>
                     <span>{label}</span>
-                    <strong>{isLarge ? formatCompact(value) : isPercent ? `${formatMoney(value)}%` : formatMoney(value)}</strong>
+                    <strong>{formattedValue}</strong>
                   </article>
                 );
               })}
@@ -1224,6 +1439,16 @@ export default function App() {
             <strong>{analysis.action}</strong>
             <div className="score-track"><i style={{ width: `${analysis.score}%` }} /></div>
             <small>{analysis.score}/100 teknik + temel puan</small>
+            <small>Finansal katki: {analysis.financialImpact >= 0 ? "+" : ""}{analysis.financialImpact}</small>
+            {analysis.missingFinancialPenalty ? (
+              <small>Eksik finansal veri etkisi: {analysis.missingFinancialPenalty}</small>
+            ) : null}
+            <div className={`forecast-chip ${analysis.forecastDirection === "Pozitif" ? "forecast-positive" : analysis.forecastDirection === "Negatif" ? "forecast-negative" : "forecast-neutral"}`}>
+              <span>{formatShortDate(analysis.forecastSessionDate)} seansi</span>
+              <b>{analysis.forecastDirection} egilim</b>
+              <small>Aralik: {formatMoney(analysis.forecastLow)} - {formatMoney(analysis.forecastHigh)}</small>
+              <small>Guven: {analysis.forecastConfidence}</small>
+            </div>
             <div className="external-score">
               <span>TradingView trend puani</span>
               <b>{Number.isFinite(selectedStock.quote?.technicalScore) ? `${selectedStock.quote.technicalScore}/100` : "-"}</b>
@@ -1233,14 +1458,20 @@ export default function App() {
           <div className="decision-list">
             <article><span>Ne zaman alinir?</span><strong>{analysis.buyZone}</strong></article>
             <article><span>Ne zaman satilir?</span><strong>{analysis.sellZone}</strong></article>
-            <article><span>Destek / Direnc</span><strong>{formatMoney(analysis.support)} / {formatMoney(analysis.resistance)}</strong></article>
+            <article><span>Destek Bolgesi</span><strong>{formatZone(analysis.supportZone)}</strong></article>
+            <article><span>Direnc Bolgesi</span><strong>{formatZone(analysis.resistanceZone)}</strong></article>
             <article><span>RSI / Volatilite</span><strong>{analysis.rsi.toFixed(1)} / {analysis.volatility.toFixed(2)}%</strong></article>
             <article><span>MA20 / MA50</span><strong>{formatMoney(analysis.ma20)} / {formatMoney(analysis.ma50)}</strong></article>
           </div>
 
           <div className="reason-box">
             <h3>Hesaplama ozeti</h3>
-            {analysis.reasons.map((reason) => <p key={reason}>{reason}</p>)}
+            {analysis.reasons.map((reason) => (
+              <article key={reason.title}>
+                <span>{reason.title}</span>
+                <p>{reason.text}</p>
+              </article>
+            ))}
           </div>
         </aside>
       </section>
