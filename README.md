@@ -1,6 +1,6 @@
 # BIST Terminal
 
-<img width="600" height="600" alt="ChatGPT Image 18 Haz 2026 12_56_54" src="https://github.com/user-attachments/assets/ed7b7cad-2f98-482d-bc5c-5ab6a8206cbc" />
+<img width="300" height="300" alt="ChatGPT Image 18 Haz 2026 12_56_54" src="https://github.com/user-attachments/assets/ed7b7cad-2f98-482d-bc5c-5ab6a8206cbc" />
 
 Borsa İstanbul hisselerini teknik ve finansal verilerle incelemek için geliştirilmiş yerel bir React uygulamasıdır.
 
